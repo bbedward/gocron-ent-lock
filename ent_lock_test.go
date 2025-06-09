@@ -1,35 +1,34 @@
-package gormlock
+package entlock
 
 import (
 	"context"
 	"testing"
 	"time"
 
+	"github.com/bbedward/gocron-ent-lock/v2/ent"
+	"github.com/bbedward/gocron-ent-lock/v2/ent/cronjoblock"
+	"github.com/bbedward/gocron-ent-lock/v2/ent/enttest"
 	"github.com/go-co-op/gocron/v2"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	testcontainerspostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
 )
 
-func TestNewGormLocker_Validation(t *testing.T) {
+func TestNewEntLocker_Validation(t *testing.T) {
 	t.Parallel()
 	tests := map[string]struct {
-		db     *gorm.DB
+		client *ent.Client
 		worker string
 		err    string
 	}{
-		"db is nil":       {db: nil, worker: "local", err: ErrGormCantBeNull.Error()},
-		"worker is empty": {db: &gorm.DB{}, worker: "", err: ErrWorkerIsRequired.Error()},
+		"client is nil":   {client: nil, worker: "local", err: ErrEntCantBeNull.Error()},
+		"worker is empty": {client: &ent.Client{}, worker: "", err: ErrWorkerIsRequired.Error()},
 	}
 
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			_, err := NewGormLocker(tc.db, tc.worker)
+			_, err := NewEntLocker(tc.client, tc.worker)
 			if assert.Error(t, err) {
 				assert.ErrorContains(t, err, tc.err)
 			}
@@ -37,26 +36,20 @@ func TestNewGormLocker_Validation(t *testing.T) {
 	}
 }
 
+func setupTestClient(ctx context.Context, t *testing.T) (*ent.Client, func()) {
+	client := enttest.Open(t, "sqlite3", "file:ent?mode=memory&cache=shared&_fk=1")
+
+	cleanup := func() {
+		client.Close()
+	}
+
+	return client, cleanup
+}
+
 func TestEnableDistributedLocking(t *testing.T) {
 	ctx := context.Background()
-	postgresContainer, err := testcontainerspostgres.Run(ctx, "docker.io/postgres:16-alpine",
-		testcontainers.WithWaitStrategy(wait.ForLog("database system is ready to accept connections").
-			WithOccurrence(2).WithStartupTimeout(5*time.Second)))
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		if err := postgresContainer.Terminate(ctx); err != nil {
-			t.Fatalf("failed to terminate container: %s", err)
-		}
-	})
-
-	connStr, err := postgresContainer.ConnectionString(ctx, "sslmode=disable", "application_name=test")
-	assert.NoError(t, err)
-
-	db, err := gorm.Open(postgres.Open(connStr), &gorm.Config{})
-	require.NoError(t, err)
-
-	err = db.AutoMigrate(&CronJobLock{})
-	require.NoError(t, err)
+	client, cleanup := setupTestClient(ctx, t)
+	defer cleanup()
 
 	resultChan := make(chan int, 10)
 	f := func(schedulerInstance int) {
@@ -64,7 +57,7 @@ func TestEnableDistributedLocking(t *testing.T) {
 		println(time.Now().Truncate(defaultPrecision).Format("2006-01-02 15:04:05.000"))
 	}
 
-	l1, err := NewGormLocker(db, "s1")
+	l1, err := NewEntLocker(client, "s1")
 	require.NoError(t, err)
 	s1, schErr := gocron.NewScheduler(gocron.WithLocation(time.UTC), gocron.WithDistributedLocker(l1))
 	require.NoError(t, schErr)
@@ -72,7 +65,7 @@ func TestEnableDistributedLocking(t *testing.T) {
 	_, err = s1.NewJob(gocron.DurationJob(1*time.Second), gocron.NewTask(f, 1))
 	require.NoError(t, err)
 
-	l2, err := NewGormLocker(db, "s2")
+	l2, err := NewEntLocker(client, "s2")
 	require.NoError(t, err)
 	s2, schErr := gocron.NewScheduler(gocron.WithLocation(time.UTC), gocron.WithDistributedLocker(l2))
 	require.NoError(t, schErr)
@@ -93,31 +86,16 @@ func TestEnableDistributedLocking(t *testing.T) {
 		results = append(results, r)
 	}
 	assert.Len(t, results, 4)
-	var allCronJobs []*CronJobLock
-	db.Find(&allCronJobs)
+
+	allCronJobs, err := client.CronJobLock.Query().All(ctx)
+	require.NoError(t, err)
 	assert.Equal(t, len(results), len(allCronJobs))
 }
 
 func TestEnableDistributedLocking_DifferentJob(t *testing.T) {
 	ctx := context.Background()
-	postgresContainer, err := testcontainerspostgres.Run(ctx, "docker.io/postgres:16-alpine",
-		testcontainers.WithWaitStrategy(wait.ForLog("database system is ready to accept connections").
-			WithOccurrence(2).WithStartupTimeout(5*time.Second)))
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		if err := postgresContainer.Terminate(ctx); err != nil {
-			t.Fatalf("failed to terminate container: %s", err)
-		}
-	})
-
-	connStr, err := postgresContainer.ConnectionString(ctx, "sslmode=disable", "application_name=test")
-	assert.NoError(t, err)
-
-	db, err := gorm.Open(postgres.Open(connStr), &gorm.Config{})
-	require.NoError(t, err)
-
-	err = db.AutoMigrate(&CronJobLock{})
-	require.NoError(t, err)
+	client, cleanup := setupTestClient(ctx, t)
+	defer cleanup()
 
 	resultChan := make(chan int, 10)
 	f := func(schedulerInstance int) {
@@ -129,7 +107,7 @@ func TestEnableDistributedLocking_DifferentJob(t *testing.T) {
 		result2Chan <- schedulerInstance
 	}
 
-	l1, err := NewGormLocker(db, "s1")
+	l1, err := NewEntLocker(client, "s1")
 	require.NoError(t, err)
 	s1, schErr := gocron.NewScheduler(gocron.WithLocation(time.UTC), gocron.WithDistributedLocker(l1))
 	require.NoError(t, schErr)
@@ -138,7 +116,7 @@ func TestEnableDistributedLocking_DifferentJob(t *testing.T) {
 	_, err = s1.NewJob(gocron.DurationJob(1*time.Second), gocron.NewTask(f2, 1), gocron.WithName("f2"))
 	require.NoError(t, err)
 
-	l2, err := NewGormLocker(db, "s2")
+	l2, err := NewEntLocker(client, "s2")
 	require.NoError(t, err)
 	s2, schErr := gocron.NewScheduler(gocron.WithLocation(time.UTC), gocron.WithDistributedLocker(l2))
 	require.NoError(t, schErr)
@@ -147,7 +125,7 @@ func TestEnableDistributedLocking_DifferentJob(t *testing.T) {
 	_, err = s2.NewJob(gocron.DurationJob(1*time.Second), gocron.NewTask(f2, 2), gocron.WithName("f2"))
 	require.NoError(t, err)
 
-	l3, err := NewGormLocker(db, "s3")
+	l3, err := NewEntLocker(client, "s3")
 	require.NoError(t, err)
 	s3, schErr := gocron.NewScheduler(gocron.WithLocation(time.UTC), gocron.WithDistributedLocker(l3))
 	require.NoError(t, schErr)
@@ -179,8 +157,9 @@ func TestEnableDistributedLocking_DifferentJob(t *testing.T) {
 		results2 = append(results2, r)
 	}
 	assert.Len(t, results2, 4, "f2 is expected 4 times")
-	var allCronJobs []*CronJobLock
-	db.Find(&allCronJobs)
+
+	allCronJobs, err := client.CronJobLock.Query().All(ctx)
+	require.NoError(t, err)
 	assert.Equal(t, len(results)+len(results2), len(allCronJobs))
 }
 
@@ -204,65 +183,32 @@ func TestJobReturningExceptionWhenUnique(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
-			postgresContainer, err := testcontainerspostgres.Run(ctx, "docker.io/postgres:16-alpine",
-				testcontainers.WithWaitStrategy(wait.ForLog("database system is ready to accept connections").
-					WithOccurrence(2).WithStartupTimeout(5*time.Second)))
-			require.NoError(t, err)
-			t.Cleanup(func() {
-				if err := postgresContainer.Terminate(ctx); err != nil {
-					t.Fatalf("failed to terminate container: %s", err)
-				}
-			})
-
-			connStr, err := postgresContainer.ConnectionString(ctx, "sslmode=disable", "application_name=test")
-			assert.NoError(t, err)
-
-			db, err := gorm.Open(postgres.Open(connStr), &gorm.Config{})
-			require.NoError(t, err)
-
-			err = db.AutoMigrate(&CronJobLock{})
-			require.NoError(t, err)
+			client, cleanup := setupTestClient(ctx, t)
+			defer cleanup()
 
 			// creating an entry to force the unique identifier error
-			cjb := &CronJobLock{
-				JobName:       "job",
-				JobIdentifier: tc.ji,
-				Worker:        "local",
-				Status:        StatusRunning,
-			}
-			require.NoError(t, db.Create(cjb).Error)
+			_, err := client.CronJobLock.
+				Create().
+				SetJobName("job").
+				SetJobIdentifier(tc.ji).
+				SetWorker("local").
+				SetStatus(StatusRunning).
+				Save(ctx)
+			require.NoError(t, err)
 
-			l, _ := NewGormLocker(db, "local", tc.lockOption...)
+			l, _ := NewEntLocker(client, "local", tc.lockOption...)
 			_, lerr := l.Lock(ctx, "job")
-			if assert.Error(t, lerr) {
-				assert.ErrorContains(t, lerr, "violates unique constraint")
-			}
+			assert.True(t, ent.IsConstraintError(lerr))
 		})
 	}
 }
 
 func TestHandleTTL(t *testing.T) {
 	ctx := context.Background()
-	postgresContainer, err := testcontainerspostgres.Run(ctx, "docker.io/postgres:16-alpine",
-		testcontainers.WithWaitStrategy(wait.ForLog("database system is ready to accept connections").
-			WithOccurrence(2).WithStartupTimeout(5*time.Second)))
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		if err := postgresContainer.Terminate(ctx); err != nil {
-			t.Fatalf("failed to terminate container: %s", err)
-		}
-	})
+	client, cleanup := setupTestClient(ctx, t)
+	defer cleanup()
 
-	connStr, err := postgresContainer.ConnectionString(ctx, "sslmode=disable", "application_name=test")
-	assert.NoError(t, err)
-
-	db, err := gorm.Open(postgres.Open(connStr), &gorm.Config{})
-	require.NoError(t, err)
-
-	err = db.AutoMigrate(&CronJobLock{})
-	require.NoError(t, err)
-
-	l1, err := NewGormLocker(db, "s1", WithTTL(1*time.Second))
+	l1, err := NewEntLocker(client, "s1", WithTTL(1*time.Second))
 	require.NoError(t, err)
 
 	s1, schErr := gocron.NewScheduler(gocron.WithLocation(time.UTC), gocron.WithDistributedLocker(l1))
@@ -277,13 +223,99 @@ func TestHandleTTL(t *testing.T) {
 
 	require.NoError(t, s1.Shutdown())
 
-	var allCronJobs []*CronJobLock
-	db.Find(&allCronJobs)
+	allCronJobs, err := client.CronJobLock.Query().All(ctx)
+	require.NoError(t, err)
 	assert.GreaterOrEqual(t, len(allCronJobs), 3)
 
 	// wait for data to expire
 	time.Sleep(1500 * time.Millisecond)
 	l1.cleanExpiredRecords()
-	db.Find(&allCronJobs)
+
+	allCronJobs, err = client.CronJobLock.Query().All(ctx)
+	require.NoError(t, err)
 	assert.Equal(t, 0, len(allCronJobs))
+}
+
+func TestEntLock_Unlock(t *testing.T) {
+	ctx := context.Background()
+	client, cleanup := setupTestClient(ctx, t)
+	defer cleanup()
+
+	// Create a lock record
+	cjl, err := client.CronJobLock.
+		Create().
+		SetJobName("test-job").
+		SetJobIdentifier("test-identifier").
+		SetWorker("test-worker").
+		SetStatus(StatusRunning).
+		Save(ctx)
+	require.NoError(t, err)
+
+	// Create entLock instance and unlock
+	lock := &entLock{client: client, id: cjl.ID}
+	err = lock.Unlock(ctx)
+	require.NoError(t, err)
+
+	// Verify the status was updated
+	updatedLock, err := client.CronJobLock.Get(ctx, cjl.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StatusFinished, updatedLock.Status)
+}
+
+func TestCleanExpiredRecords(t *testing.T) {
+	ctx := context.Background()
+	client, cleanup := setupTestClient(ctx, t)
+	defer cleanup()
+
+	locker, err := NewEntLocker(client, "test-worker", WithTTL(1*time.Second))
+	require.NoError(t, err)
+
+	// Create some old finished records
+	pastTime := time.Now().Add(-2 * time.Second)
+	_, err = client.CronJobLock.
+		Create().
+		SetJobName("old-job").
+		SetJobIdentifier("old-identifier").
+		SetWorker("test-worker").
+		SetStatus(StatusFinished).
+		SetCreatedAt(pastTime).
+		SetUpdatedAt(pastTime).
+		Save(ctx)
+	require.NoError(t, err)
+
+	// Create a recent finished record (should not be deleted)
+	_, err = client.CronJobLock.
+		Create().
+		SetJobName("recent-job").
+		SetJobIdentifier("recent-identifier").
+		SetWorker("test-worker").
+		SetStatus(StatusFinished).
+		Save(ctx)
+	require.NoError(t, err)
+
+	// Create a running record (should not be deleted)
+	_, err = client.CronJobLock.
+		Create().
+		SetJobName("running-job").
+		SetJobIdentifier("running-identifier").
+		SetWorker("test-worker").
+		SetStatus(StatusRunning).
+		Save(ctx)
+	require.NoError(t, err)
+
+	// Run cleanup
+	locker.cleanExpiredRecords()
+
+	// Check results
+	finishedJobs, err := client.CronJobLock.Query().
+		Where(cronjoblock.StatusEQ(StatusFinished)).
+		All(ctx)
+	require.NoError(t, err)
+	assert.Len(t, finishedJobs, 1, "Should have 1 recent finished job remaining")
+
+	runningJobs, err := client.CronJobLock.Query().
+		Where(cronjoblock.StatusEQ(StatusRunning)).
+		All(ctx)
+	require.NoError(t, err)
+	assert.Len(t, runningJobs, 1, "Should have 1 running job remaining")
 }

@@ -4,13 +4,12 @@ go 1.23.0
 
 toolchain go1.24.1
 
-replace github.com/go-co-op/gocron-gorm-lock/v2 => ../
+replace github.com/bbedward/gocron-ent-lock/v2 => ../
 
 require (
-	github.com/go-co-op/gocron-gorm-lock/v2 v2.0.0-00010101000000-000000000000
+	github.com/bbedward/gocron-ent-lock/v2 v2.0.0-00010101000000-000000000000
 	github.com/go-co-op/gocron/v2 v2.16.1
-	gorm.io/driver/sqlite v1.5.7
-	gorm.io/gorm v1.26.0
+	github.com/lib/pq v1.10.9
 )
 
 require (
